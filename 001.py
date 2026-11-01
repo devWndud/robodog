@@ -1,19 +1,20 @@
 """웹캠 + YOLOv8 사람 감지: 중앙 정지, 좌우 TTS 경고.
 
-설치: pip install ultralytics opencv-python
+설치: pip install -r requirements.txt
 실행: python 001.py
-실제 로봇: python 001.py --stop-command '로봇의 정지 명령'
+FTC Java 클라이언트: ws://이_PC의_IP:8765
 
-기본 실행은 정지 신호를 출력하는 모의 실행이다. --stop-command에는
-속도를 0으로 만들고 정지 상태를 유지하는 실제 제어 명령을 지정해야 한다.
+Java 클라이언트가 상태를 요청하면 최신 감지 결과를 JSON으로 응답한다.
+감지 전에는 주행 불가, 감지 갱신이 1초 이상 멈추면 정지를 유지한다.
 자동 주행 재개는 하지 않는다. 화면 방향은 반전하지 않은 웹캠 기준이다.
 macOS는 say, Linux는 espeak-ng 또는 espeak가 있어야 TTS가 동작한다.
 """
 
 import argparse
-import shlex
+import json
 import shutil
 import subprocess
+import threading
 import time
 
 
@@ -37,21 +38,74 @@ def choose_action(zones):
     return "CLEAR"
 
 
-class RobotStop:
-    def __init__(self, command):
-        self.command = shlex.split(command) if command else None
+class SafetyServer:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
         self.stopped = False
+        self.action = "WAIT"
+        self.updated_at = None
+        self.lock = threading.Lock()
+        self.server = None
+        self.thread = None
+        self.clients = set()
+
+    def update(self, action):
+        with self.lock:
+            now = time.monotonic()
+            if self.updated_at is not None and now - self.updated_at >= 1.0:
+                self.stopped = True
+            self.stopped = self.stopped or action == "STOP"
+            self.action = action
+            self.updated_at = now
+
+    def snapshot(self):
+        with self.lock:
+            if self.updated_at is not None and time.monotonic() - self.updated_at >= 1.0:
+                self.stopped = True
+            action = "STOP" if self.stopped else self.action
+            return {"type": "safety", "action": action,
+                    "stop": self.stopped or self.updated_at is None}
 
     def stop(self, reason):
-        if self.stopped:
-            return
-        if self.command:
-            # 로봇 SDK/ROS를 직접 사용할 경우 이 부분을 정지 API로 교체한다.
-            subprocess.run(self.command, check=True, timeout=2)
-            print(f"[STOP] 정지 명령 완료: {reason}", flush=True)
-        else:
-            print(f"[SIMULATION] 정지 요청 (하드웨어 미연결): {reason}", flush=True)
-        self.stopped = True
+        with self.lock:
+            self.stopped = True
+        print(f"[STOP] WebSocket 정지 상태 설정: {reason}", flush=True)
+
+    def handle_client(self, websocket):
+        from websockets.exceptions import ConnectionClosed
+
+        with self.lock:
+            self.clients.add(websocket)
+        try:
+            for message in websocket:
+                if message != "STATUS":
+                    websocket.close(code=1008, reason="Expected STATUS")
+                    return
+                websocket.send(json.dumps(self.snapshot()))
+        except ConnectionClosed:
+            pass
+        finally:
+            with self.lock:
+                self.clients.discard(websocket)
+
+    def start(self):
+        from websockets.sync.server import serve
+
+        self.server = serve(self.handle_client, self.host, self.port,
+                            max_size=128, close_timeout=1)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        print(f"[WebSocket] {self.host}:{self.port} 서버 시작", flush=True)
+
+    def close(self):
+        if self.server is not None:
+            with self.lock:
+                clients = list(self.clients)
+            for client in clients:
+                client.close(code=1001, reason="Detector stopped")
+            self.server.shutdown()
+            self.thread.join(timeout=2)
 
 
 class VoiceWarning:
@@ -102,18 +156,20 @@ def main():
     parser.add_argument("--model", default="yolov8n.pt")
     parser.add_argument("--confidence", type=float, default=0.5)
     parser.add_argument("--warning-interval", type=float, default=3.0)
-    parser.add_argument("--stop-command", help="정지 상태를 유지하는 실제 로봇 제어 명령")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     if not 0 < args.confidence <= 1 or args.warning_interval <= 0:
         parser.error("confidence는 0 초과 1 이하, warning-interval은 0 초과여야 합니다.")
 
-    robot = RobotStop(args.stop_command)
+    if not 1 <= args.port <= 65535:
+        parser.error("port는 1~65535여야 합니다.")
+    robot = SafetyServer(args.host, args.port)
     camera = None
     voice = None
     cv2 = None
-    if not robot.command:
-        print("[SIMULATION] 실제 로봇 정지 기능 미연결. --stop-command를 지정하세요.", flush=True)
     try:
+        robot.start()
         import cv2
         from ultralytics import YOLO
 
@@ -142,17 +198,16 @@ def main():
                     cv2.putText(frame, zone, (int(x1), max(20, int(y1) - 8)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             action = choose_action(zones)
+            robot.update(action)
             if action == "STOP":
-                robot.stop("정면 사람 감지")
                 voice.close()
             elif action.startswith("WARN"):
                 voice.warn(action)
 
             for boundary in (width // 3, width * 2 // 3):
                 cv2.line(frame, (boundary, 0), (boundary, height), (180, 180, 180), 1)
-            mode = "LIVE" if robot.command else "SIMULATION"
             state = "STOP LATCHED" if robot.stopped else action
-            cv2.putText(frame, f"{mode} | {state} | Q: quit", (10, 28),
+            cv2.putText(frame, f"WS SERVER | {state} | Q: quit", (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
             cv2.imshow("Robot person detection", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -162,6 +217,7 @@ def main():
         try:
             robot.stop("프로그램 종료 또는 감지 오류")
         finally:
+            robot.close()
             if voice is not None:
                 voice.close()
             if camera is not None:
