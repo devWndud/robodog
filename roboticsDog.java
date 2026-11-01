@@ -7,6 +7,7 @@ import com.qualcomm.robotcore.hardware.Servo;
 import org.java_websocket.client.WebSocketClient;
 import org.java_websocket.handshake.ServerHandshake;
 import org.json.JSONObject;
+import org.json.JSONException;
 import java.net.URI;
 
 @TeleOp(name = "roboticsDog (YOLO Auto Avoid)")
@@ -65,6 +66,9 @@ public class roboticsDog extends LinearOpMode {
                     telemetry.addData("Vision", client.status);
                     telemetry.addData("Stop latched", client.stopLatched);
                     telemetry.addData("Motors", appliedCommand);
+                    if (!client.errorResponse.isEmpty()) {
+                        telemetry.addData("Failed response", client.errorResponse);
+                    }
                 }
                 telemetry.update();
                 sleep(10);
@@ -140,16 +144,22 @@ public class roboticsDog extends LinearOpMode {
         private String command = "STOP";
         private double power = 0;
         private String status = "CONNECTING";
+        private String lastResponse = "";
+        private String errorResponse = "";
 
         SafetyClient(URI uri) {
             super(uri);
         }
 
         private void block(String reason) {
+            // 뒤따르는 타임아웃/연결 종료로 최초 오류 원인이 가려지지 않게 한다.
+            if (!stopLatched) {
+                status = reason;
+                errorResponse = lastResponse;
+            }
             stopLatched = true;
             command = "STOP";
             power = 0;
-            status = reason;
         }
 
         synchronized void pollStatus() {
@@ -182,11 +192,17 @@ public class roboticsDog extends LinearOpMode {
         @Override
         public synchronized void onOpen(ServerHandshake handshake) {
             connected = true;
-            status = "WAITING FOR DETECTION";
+            if (!stopLatched) {
+                status = "WAITING FOR DETECTION (drive v2)";
+            }
         }
 
         @Override
         public synchronized void onMessage(String message) {
+            lastResponse = message.replace('\n', ' ').replace('\r', ' ');
+            if (lastResponse.length() > 220) {
+                lastResponse = lastResponse.substring(0, 220) + "...";
+            }
             long now = System.nanoTime();
             if (!pending || now - sentAt >= TIMEOUT_NS) {
                 block("UNEXPECTED OR LATE RESPONSE");
@@ -199,7 +215,24 @@ public class roboticsDog extends LinearOpMode {
                     return;
                 }
                 JSONObject data = new JSONObject(message);
+                // 필드를 읽기 전에 프로토콜을 확인한다. 구버전 safety JSON도
+                // 올바른 JSON이므로 문법 오류와 별도로 안내해야 한다.
+                if (!"drive".equals(data.optString("type")) || data.optInt("version", -1) != 2) {
+                    block("PROTOCOL MISMATCH: need Python drive v2; update BOTH sides");
+                    return;
+                }
+                for (String field : new String[]{"command", "fault", "power", "valid_for_ms", "reason"}) {
+                    if (!data.has(field) || data.isNull(field)) {
+                        block("MISSING FIELD: " + field);
+                        return;
+                    }
+                }
+                if (!(data.get("command") instanceof String) || !(data.get("reason") instanceof String)) {
+                    block("INVALID FIELD TYPE: command/reason must be strings");
+                    return;
+                }
                 String nextCommand = data.getString("command");
+                String nextReason = data.getString("reason");
                 Object faultValue = data.get("fault");
                 Object powerValue = data.get("power");
                 Object ttlValue = data.get("valid_for_ms");
@@ -231,10 +264,12 @@ public class roboticsDog extends LinearOpMode {
                 } else if (!stopLatched) {
                     command = nextCommand;
                     power = nextPower;
-                    status = nextCommand + " / " + data.getString("reason");
+                    status = nextCommand + " / " + nextReason;
                 }
-            } catch (Exception e) {
-                block("INVALID JSON");
+            } catch (JSONException e) {
+                block("JSON ERROR: " + e.getMessage());
+            } catch (RuntimeException e) {
+                block("RESPONSE ERROR: " + e.getClass().getSimpleName());
             }
         }
 

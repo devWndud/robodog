@@ -204,7 +204,11 @@ class SafetyServer:
                 if not activated:
                     self.begin_control()
                     activated = True
-                websocket.send(json.dumps(self.snapshot()))
+                    response = json.dumps(self.snapshot())
+                    print(f"[WebSocket TX first] {response}", flush=True)
+                else:
+                    response = json.dumps(self.snapshot())
+                websocket.send(response)
         except ConnectionClosed:
             pass
         finally:
@@ -220,7 +224,8 @@ class SafetyServer:
                             max_size=128, close_timeout=1)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
-        print(f"[WebSocket] {self.host}:{self.port} 서버 시작", flush=True)
+        print(f"[WebSocket] {self.host}:{self.port} 서버 시작 | protocol=drive v2", flush=True)
+        print(f"[Source] {__file__}", flush=True)
 
     def close(self):
         if self.server is not None:

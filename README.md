@@ -99,3 +99,16 @@ API 참고: [Python websockets](https://websockets.readthedocs.io/en/stable/refe
 [Java-WebSocket](https://github.com/TooTallNate/Java-WebSocket).
 
 테스트: `python -m unittest -v test_safety` (카메라/로봇 없이 판단 로직과 로컬 통신 검증).
+
+## Control Hub 응답 오류 확인
+
+이전 Java의 `INVALID JSON`은 잘못된 JSON뿐 아니라 필드 누락에도 표시됩니다.
+구버전 Python은 `type: safety, action: ...`를 보내므로 새 Java의 `command` 필드와
+맞지 않습니다. 반대로 구버전 Java도 새 Python의 응답을 처리하지 못합니다.
+Python과 Java를 함께 업데이트하고, 기존 Python 프로세스를 종료한 뒤 재실행하세요.
+
+현재 서버는 시작 시 `protocol=drive v2`와 실행 파일 경로를 표시하고,
+첫 응답을 `[WebSocket TX first]`로 출력합니다. Control Hub에서는
+`PROTOCOL MISMATCH`, `MISSING FIELD`, `JSON ERROR`로 원인을 구분하고
+`Failed response`에 최초 오류의 수신 메시지를 표시합니다.
+오류 후에는 Python과 OpMode를 재시작해야 합니다. 문제가 계속되면 이 두 로그를 비교하세요.
