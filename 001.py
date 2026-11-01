@@ -1,12 +1,13 @@
-"""웹캠 + YOLOv8 사람 감지: 중앙 정지, 좌우 TTS 경고.
+"""웹캠 + YOLOv8 감지로 FTC 로봇에 저속 전진/회피 명령을 전송한다.
 
 설치: pip install -r requirements.txt
 실행: python 001.py
-FTC Java 클라이언트: ws://이_PC의_IP:8765
+FTC Java 클라이언트: ws://이_PC의_IP:5000
 
 Java 클라이언트가 상태를 요청하면 최신 감지 결과를 JSON으로 응답한다.
 감지 전에는 주행 불가, 감지 갱신이 1초 이상 멈추면 정지를 유지한다.
-자동 주행 재개는 하지 않는다. 화면 방향은 반전하지 않은 웹캠 기준이다.
+정면 감지 → 정지 → 짧은 좌우 회전 → 재확인 후 전진한다.
+통신/감지 오류는 정지를 유지한다. 화면 방향은 반전하지 않은 웹캠 기준이다.
 macOS는 say, Linux는 espeak-ng 또는 espeak가 있어야 TTS가 동작한다.
 """
 
@@ -38,56 +39,177 @@ def choose_action(zones):
     return "CLEAR"
 
 
+class AvoidancePlanner:
+    """바운딩 박스 기반 휴리스틱. 빈 구역이 실제 통행 가능함을 보장하지 않는다."""
+    PAUSE_SECONDS = 0.3
+    TURN_SECONDS = 0.5
+    MAX_TURNS = 4
+    CLEAR_FRAMES = 3
+
+    def __init__(self):
+        self.phase = "CHECK"
+        self.command = "STOP"
+        self.reason = "WAIT"
+        self.deadline = 0.0
+        self.clear_frames = 0
+        self.attempts = 0
+
+    def advance(self, now):
+        # 추론이 끝나지 않아도 서버 요청 시 회전 시간을 제한한다.
+        if self.phase == "TURN" and now >= self.deadline:
+            self.phase = "CHECK"
+            self.command = "STOP"
+            self.reason = "RECHECK"
+            self.deadline += self.PAUSE_SECONDS
+            self.clear_frames = 0
+
+    def observe(self, boxes, width, captured_at, now):
+        self.advance(now)
+        left_edge, right_edge = width / 3, width * 2 / 3
+        front = [box for box in boxes if box[2] >= left_edge and box[0] <= right_edge]
+        left_blocked = any(box[0] < left_edge for box in boxes)
+        right_blocked = any(box[2] > right_edge for box in boxes)
+
+        if self.phase == "TURN":
+            blocked = left_blocked if self.command == "LEFT" else right_blocked
+            if blocked:
+                self.command = "STOP"
+                self.reason = "TURN_SIDE_BLOCKED"
+                self.phase = "PAUSE"
+                self.deadline = now + self.PAUSE_SECONDS
+            return
+
+        if self.phase in {"PAUSE", "CHECK"} and captured_at < self.deadline:
+            return  # 정지/회전 전에 촬영된 프레임으로 재출발하지 않는다.
+
+        if not front:
+            if self.phase == "FORWARD":
+                return
+            self.clear_frames += 1
+            self.command = "STOP"
+            self.reason = "CONFIRM_CLEAR"
+            if self.clear_frames >= self.CLEAR_FRAMES:
+                self.phase = "FORWARD"
+                self.command = "FORWARD"
+                self.reason = "FRONT_CLEAR"
+                self.attempts = 0
+            return
+
+        self.clear_frames = 0
+        if self.phase == "FORWARD" or self.reason == "WAIT":
+            self.phase = "PAUSE"
+            self.command = "STOP"
+            self.reason = "FRONT_OBSTACLE"
+            self.deadline = now + self.PAUSE_SECONDS
+            return
+        if (left_blocked and right_blocked) or self.attempts >= self.MAX_TURNS:
+            self.phase = "CHECK"
+            self.command = "STOP"
+            self.reason = "BLOCKED" if self.attempts < self.MAX_TURNS else "TURN_LIMIT"
+            return
+
+        if left_blocked:
+            direction = "RIGHT"
+        elif right_blocked:
+            direction = "LEFT"
+        else:
+            # 양옆에 감지된 대상이 없으면 정면 대상의 중심에서 먼 방향으로 회전.
+            center = sum((b[0] + b[2]) / 2 for b in front) / len(front)
+            direction = "RIGHT" if center <= width / 2 else "LEFT"
+        self.phase = "TURN"
+        self.command = direction
+        self.reason = "AVOID_FRONT"
+        self.deadline = now + self.TURN_SECONDS
+        self.attempts += 1
+
+
 class SafetyServer:
     def __init__(self, host, port):
         self.host = host
         self.port = port
         self.stopped = False
-        self.action = "WAIT"
+        self.planner = AvoidancePlanner()
+        self.fault_reason = ""
         self.updated_at = None
         self.lock = threading.Lock()
         self.server = None
         self.thread = None
         self.clients = set()
+        self.control_active = False
 
-    def update(self, action, captured_at=None):
+    def begin_control(self):
+        with self.lock:
+            if not self.control_active:
+                self.planner = AvoidancePlanner()
+                self.control_active = True
+
+    def update(self, boxes, width, captured_at=None):
         with self.lock:
             now = time.monotonic()
-            if captured_at is not None and now - captured_at >= 1.0:
+            captured_at = now if captured_at is None else captured_at
+            if (now - captured_at >= 1.0
+                    or (self.updated_at is not None and now - self.updated_at >= 1.0)):
                 self.stopped = True
-            if self.updated_at is not None and now - self.updated_at >= 1.0:
-                self.stopped = True
-            self.stopped = self.stopped or action == "STOP"
-            self.action = action
-            self.updated_at = now if captured_at is None else captured_at
+                self.fault_reason = "STALE_DETECTION"
+            if self.updated_at is not None and captured_at <= self.updated_at:
+                return
+            self.updated_at = captured_at
+            if not self.stopped and self.control_active:
+                self.planner.observe(boxes, width, captured_at, now)
 
     def snapshot(self):
         with self.lock:
-            if self.updated_at is not None and time.monotonic() - self.updated_at >= 1.0:
+            now = time.monotonic()
+            if self.updated_at is not None and now - self.updated_at >= 1.0:
                 self.stopped = True
-            action = "STOP" if self.stopped else self.action
-            return {"type": "safety", "action": action,
-                    "stop": self.stopped or self.updated_at is None}
+                self.fault_reason = "STALE_DETECTION"
+            self.planner.advance(now)
+            command = "STOP" if self.stopped else self.planner.command
+            # Java가 네트워크 왕복 시간까지 빼서 명령 유효 시간을 계산한다.
+            ttl = 0.5
+            if self.updated_at is not None:
+                ttl = min(ttl, max(0, self.updated_at + 1.0 - now))
+            if command in {"LEFT", "RIGHT"}:
+                ttl = min(ttl, max(0, self.planner.deadline - now))
+            ttl_ms = int(ttl * 1000)
+            if ttl_ms <= 0:
+                command = "STOP"
+            return {"type": "drive", "version": 2, "command": command,
+                    "power": 0.0 if command == "STOP" else 0.2,
+                    "valid_for_ms": ttl_ms, "fault": self.stopped,
+                    "reason": self.fault_reason if self.stopped else self.planner.reason}
 
     def stop(self, reason):
         with self.lock:
             self.stopped = True
+            self.fault_reason = reason
         print(f"[STOP] WebSocket 정지 상태 설정: {reason}", flush=True)
 
     def handle_client(self, websocket):
         from websockets.exceptions import ConnectionClosed
 
         with self.lock:
-            self.clients.add(websocket)
+            busy = bool(self.clients)
+            if not busy:
+                self.clients.add(websocket)
+        if busy:
+            websocket.close(code=1008, reason="Only one robot controller is allowed")
+            return
+        activated = False
         try:
             for message in websocket:
                 if message != "STATUS":
                     websocket.close(code=1008, reason="Expected STATUS")
                     return
+                if not activated:
+                    self.begin_control()
+                    activated = True
                 websocket.send(json.dumps(self.snapshot()))
         except ConnectionClosed:
             pass
         finally:
+            if activated:
+                self.stop("컨트롤러 연결 해제")
             with self.lock:
                 self.clients.discard(websocket)
 
@@ -207,7 +329,7 @@ def main():
     parser.add_argument("--confidence", type=float, default=0.5)
     parser.add_argument("--warning-interval", type=float, default=3.0)
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=5000)
     args = parser.parse_args()
     if args.imgsz < 32 or args.imgsz % 32:
         parser.error("imgsz는 32 이상의 32 배수여야 합니다.")
@@ -223,6 +345,7 @@ def main():
     try:
         robot.start()
         import cv2
+        import numpy as np
         from ultralytics import YOLO
 
         voice = VoiceWarning(args.warning_interval)
@@ -230,6 +353,9 @@ def main():
         # COCO 사전학습 YOLOv8 모델의 person 클래스만 사용한다.
         if model.names.get(0) != "person":
             raise ValueError("0번 클래스가 person인 COCO YOLOv8 모델을 사용하세요.")
+        # 최초 모델 초기화 시간을 이동 중 감지 지연에 포함하지 않도록 사전 실행한다.
+        model.predict(np.zeros((args.imgsz, args.imgsz, 3), dtype=np.uint8),
+                      classes=[0], imgsz=args.imgsz, verbose=False)
         camera = cv2.VideoCapture(args.camera)
         if not camera.isOpened():
             raise RuntimeError("웹캠을 열 수 없습니다. 연결과 --camera 번호를 확인하세요.")
@@ -247,8 +373,10 @@ def main():
                                    imgsz=args.imgsz, verbose=False)[0]
             inference_ms = (time.monotonic() - started) * 1000
             zones = set()
+            boxes = []
             if result.boxes is not None:
-                for x1, y1, x2, y2 in result.boxes.xyxy.cpu().tolist():
+                boxes = result.boxes.xyxy.cpu().tolist()
+                for x1, y1, x2, y2 in boxes:
                     zone = person_zone(x1, x2, width)
                     zones.add(zone)
                     color = (0, 0, 255) if zone == "CENTER" else (0, 200, 255)
@@ -257,7 +385,7 @@ def main():
                         cv2.putText(frame, zone, (int(x1), max(20, int(y1) - 8)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             action = choose_action(zones)
-            robot.update(action, captured_at)
+            robot.update(boxes, width, captured_at)
             age_ms = (time.monotonic() - captured_at) * 1000
             timing = f"infer={inference_ms:.0f}ms frame-age={age_ms:.0f}ms"
             if time.monotonic() - last_log >= 2:
@@ -273,7 +401,8 @@ def main():
 
             for boundary in (width // 3, width * 2 // 3):
                 cv2.line(frame, (boundary, 0), (boundary, height), (180, 180, 180), 1)
-            state = "STOP LATCHED" if robot.stopped else action
+            motion = robot.snapshot()
+            state = f"{motion['command']} {motion['reason']}"
             cv2.putText(frame, f"WS SERVER | {state} | Q: quit", (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
             cv2.putText(frame, timing, (10, 55), cv2.FONT_HERSHEY_SIMPLEX,

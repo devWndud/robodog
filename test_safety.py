@@ -12,6 +12,22 @@ spec.loader.exec_module(detector)
 
 
 class SafetyTests(unittest.TestCase):
+    def active_server(self):
+        server = detector.SafetyServer("127.0.0.1", 0)
+        server.begin_control()
+        return server
+
+    def test_no_motion_planning_before_java_starts_requesting(self):
+        server = detector.SafetyServer("127.0.0.1", 0)
+        for t in (10, 10.1, 10.2, 10.3):
+            message = self.observe(server, [], t)
+            self.assertEqual(message["command"], "STOP")
+        self.assertEqual(server.planner.attempts, 0)
+        server.begin_control()
+        for t in (10.4, 10.5, 10.6):
+            message = self.observe(server, [], t)
+        self.assertEqual(message["command"], "FORWARD")
+
     def test_latest_camera_discards_intermediate_frames(self):
         ready = threading.Event()
         finish = threading.Event()
@@ -47,8 +63,8 @@ class SafetyTests(unittest.TestCase):
     def test_old_result_cannot_enable_driving(self):
         server = detector.SafetyServer("127.0.0.1", 0)
         with patch.object(detector.time, "monotonic", return_value=12):
-            server.update("CLEAR", captured_at=10)
-            self.assertTrue(server.snapshot()["stop"])
+            server.update([], 900, captured_at=10)
+            self.assertTrue(server.snapshot()["fault"])
 
     def test_regions_and_priority(self):
         self.assertEqual(detector.person_zone(0, 100, 900), "LEFT")
@@ -61,25 +77,93 @@ class SafetyTests(unittest.TestCase):
                               ({"LEFT", "CENTER", "RIGHT"}, "STOP")]:
             self.assertEqual(detector.choose_action(zones), action)
 
-    def test_wait_stop_and_no_automatic_restart(self):
-        server = detector.SafetyServer("127.0.0.1", 0)
-        self.assertEqual(server.snapshot(), {"type": "safety", "action": "WAIT", "stop": True})
-        server.update("CLEAR")
-        self.assertFalse(server.snapshot()["stop"])
-        server.update("STOP")
-        server.update("CLEAR")
-        self.assertEqual(server.snapshot()["action"], "STOP")
+    def test_wait_fault_and_no_automatic_restart(self):
+        server = self.active_server()
+        self.assertEqual(server.snapshot()["command"], "STOP")
+        self.assertEqual(server.snapshot()["power"], 0)
+        for _ in range(3):
+            server.update([], 900)
+        self.assertEqual(server.snapshot()["command"], "FORWARD")
+        self.assertEqual(server.snapshot()["power"], 0.2)
+        server.stop("test fault")
+        server.update([], 900)
+        self.assertEqual(server.snapshot()["command"], "STOP")
+        self.assertTrue(server.snapshot()["fault"])
 
     def test_stale_detection_latches_even_if_inference_resumes(self):
         for check_snapshot in (True, False):
-            server = detector.SafetyServer("127.0.0.1", 0)
+            server = self.active_server()
             with patch.object(detector.time, "monotonic", return_value=10.0):
-                server.update("CLEAR")
+                server.update([], 900)
             with patch.object(detector.time, "monotonic", return_value=11.1):
                 if check_snapshot:
-                    self.assertTrue(server.snapshot()["stop"])
-                server.update("CLEAR")
-                self.assertTrue(server.snapshot()["stop"])
+                    self.assertTrue(server.snapshot()["fault"])
+                server.update([], 900)
+                self.assertTrue(server.snapshot()["fault"])
+
+    def observe(self, server, boxes, now, captured_at=None):
+        with patch.object(detector.time, "monotonic", return_value=now):
+            server.update(boxes, 900, captured_at)
+            return server.snapshot()
+
+    def test_front_stops_then_turns_away_from_occupied_side(self):
+        for side_box, expected in [([0, 0, 200, 100], "RIGHT"),
+                                   ([700, 0, 899, 100], "LEFT")]:
+            server = self.active_server()
+            for t in (10, 10.1, 10.2):
+                message = self.observe(server, [], t)
+            self.assertEqual(message["command"], "FORWARD")
+            obstacles = [[400, 0, 500, 100], side_box]
+            self.assertEqual(self.observe(server, obstacles, 10.3)["command"], "STOP")
+            self.assertEqual(self.observe(server, obstacles, 10.4)["command"], "STOP")
+            message = self.observe(server, obstacles, 10.7)
+            self.assertEqual(message["command"], expected)
+            self.assertEqual(message["power"], 0.2)
+            self.assertLessEqual(message["valid_for_ms"], 500)
+            # 추론 호출이 없어도 회전 기한이 지나면 STOP을 반환한다.
+            with patch.object(detector.time, "monotonic", return_value=11.21):
+                self.assertEqual(server.snapshot()["command"], "STOP")
+            # 회전 중 찍은 프레임은 재출발 판단에 사용하지 않는다.
+            self.assertEqual(self.observe(server, [], 11.3, 11.15)["command"], "STOP")
+            for t in (11.51, 11.61):
+                self.assertEqual(self.observe(server, [], t)["command"], "STOP")
+            self.assertEqual(self.observe(server, [], 11.71)["command"], "FORWARD")
+
+    def test_both_sides_blocked_and_spanning_box_stop(self):
+        server = self.active_server()
+        boxes = [[0, 0, 900, 100]]
+        self.observe(server, boxes, 10)
+        message = self.observe(server, boxes, 10.4)
+        self.assertEqual(message["command"], "STOP")
+        self.assertEqual(message["reason"], "BLOCKED")
+        self.assertFalse(message["fault"])
+
+    def test_obstacle_on_turn_side_interrupts_turn(self):
+        server = self.active_server()
+        front = [[400, 0, 500, 100]]
+        self.observe(server, front, 10)
+        self.assertEqual(self.observe(server, front, 10.4)["command"], "RIGHT")
+        message = self.observe(server, front + [[700, 0, 800, 100]], 10.5)
+        self.assertEqual(message["command"], "STOP")
+        self.assertEqual(message["reason"], "TURN_SIDE_BLOCKED")
+
+    def test_turn_attempt_limit(self):
+        planner = detector.AvoidancePlanner()
+        front = [[400, 0, 500, 100]]
+        planner.observe(front, 900, 10, 10)
+        now = 10.4
+        for _ in range(4):
+            planner.observe(front, 900, now, now)
+            self.assertEqual(planner.command, "RIGHT")
+            now += 0.81
+        planner.observe(front, 900, now, now)
+        self.assertEqual(planner.command, "STOP")
+        self.assertEqual(planner.reason, "TURN_LIMIT")
+
+    def test_duplicate_frame_does_not_count_as_clear_confirmation(self):
+        server = self.active_server()
+        for t in (10.1, 10.2, 10.3):
+            self.assertEqual(self.observe(server, [], t, 10)["command"], "STOP")
 
     def test_websocket_exchange_and_late_client(self):
         from websockets.sync.client import connect
@@ -90,20 +174,23 @@ class SafetyTests(unittest.TestCase):
         try:
             with connect(url) as client:
                 client.send("STATUS")
-                self.assertEqual(json.loads(client.recv(timeout=2))["action"], "WAIT")
-                for action in ("WARN_LEFT", "WARN_RIGHT", "WARN_BOTH", "CLEAR"):
-                    server.update(action)
-                    client.send("STATUS")
-                    message = json.loads(client.recv(timeout=2))
-                    self.assertEqual(message["action"], action)
-                    self.assertFalse(message["stop"])
-                server.update("STOP")
+                self.assertEqual(json.loads(client.recv(timeout=2))["reason"], "WAIT")
+                for _ in range(3):
+                    server.update([], 900)
                 client.send("STATUS")
-                self.assertTrue(json.loads(client.recv(timeout=2))["stop"])
+                message = json.loads(client.recv(timeout=2))
+                self.assertEqual(message["type"], "drive")
+                self.assertEqual(message["version"], 2)
+                self.assertEqual(message["command"], "FORWARD")
+                self.assertEqual(message["power"], 0.2)
+                server.update([[400, 0, 500, 100]], 900)
+                client.send("STATUS")
+                self.assertEqual(json.loads(client.recv(timeout=2))["command"], "STOP")
+                server.stop("test fault")
             # 정지 후 접속하는 클라이언트도 STOP을 받는다.
             with connect(url) as client:
                 client.send("STATUS")
-                self.assertEqual(json.loads(client.recv(timeout=2))["action"], "STOP")
+                self.assertTrue(json.loads(client.recv(timeout=2))["fault"])
         finally:
             server.close()
 
