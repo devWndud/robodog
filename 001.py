@@ -50,14 +50,16 @@ class SafetyServer:
         self.thread = None
         self.clients = set()
 
-    def update(self, action):
+    def update(self, action, captured_at=None):
         with self.lock:
             now = time.monotonic()
+            if captured_at is not None and now - captured_at >= 1.0:
+                self.stopped = True
             if self.updated_at is not None and now - self.updated_at >= 1.0:
                 self.stopped = True
             self.stopped = self.stopped or action == "STOP"
             self.action = action
-            self.updated_at = now
+            self.updated_at = now if captured_at is None else captured_at
 
     def snapshot(self):
         with self.lock:
@@ -108,6 +110,52 @@ class SafetyServer:
             self.thread.join(timeout=2)
 
 
+class LatestCamera:
+    """캡처를 계속 수행하고 아직 처리하지 않은 최신 한 장만 유지한다."""
+    def __init__(self, capture):
+        self.capture = capture
+        self.condition = threading.Condition()
+        self.frame = None
+        self.sequence = 0
+        self.consumed = 0
+        self.failed = False
+        self.closed = threading.Event()
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+
+    def _read(self):
+        try:
+            while not self.closed.is_set():
+                ok, frame = self.capture.read()
+                with self.condition:
+                    if not ok:
+                        self.failed = True
+                        self.condition.notify_all()
+                        return
+                    self.frame = frame
+                    self.captured_at = time.monotonic()
+                    self.sequence += 1
+                    self.condition.notify_all()
+        finally:
+            with self.condition:
+                self.failed = True
+                self.condition.notify_all()
+            self.capture.release()
+
+    def read(self):
+        with self.condition:
+            available = self.condition.wait_for(
+                lambda: self.failed or self.sequence != self.consumed, timeout=1)
+            if not available or self.failed:
+                raise RuntimeError("카메라 프레임 수신 중단 또는 1초 초과 지연")
+            self.consumed = self.sequence
+            return self.frame, self.captured_at
+
+    def release(self):
+        self.closed.set()
+        self.thread.join(timeout=2)
+
+
 class VoiceWarning:
     MESSAGES = {
         "WARN_LEFT": "왼쪽에 사람이 있습니다. 주의하세요.",
@@ -153,12 +201,16 @@ class VoiceWarning:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--imgsz", type=int, default=320, help="YOLO 입력 크기")
+    parser.add_argument("--no-display", action="store_true", help="영상 창 없이 실행")
     parser.add_argument("--model", default="yolov8n.pt")
     parser.add_argument("--confidence", type=float, default=0.5)
     parser.add_argument("--warning-interval", type=float, default=3.0)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
+    if args.imgsz < 32 or args.imgsz % 32:
+        parser.error("imgsz는 32 이상의 32 배수여야 합니다.")
     if not 0 < args.confidence <= 1 or args.warning_interval <= 0:
         parser.error("confidence는 0 초과 1 이하, warning-interval은 0 초과여야 합니다.")
 
@@ -181,34 +233,51 @@ def main():
         camera = cv2.VideoCapture(args.camera)
         if not camera.isOpened():
             raise RuntimeError("웹캠을 열 수 없습니다. 연결과 --camera 번호를 확인하세요.")
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 백엔드에 따라 지원하지 않을 수 있다.
+        camera = LatestCamera(camera)
+        last_log = 0.0
 
         while True:
-            ok, frame = camera.read()
-            if not ok:
-                raise RuntimeError("웹캠 영상 수신이 중단되었습니다.")
+            frame, captured_at = camera.read()
             height, width = frame.shape[:2]
-            result = model.predict(frame, classes=[0], conf=args.confidence, verbose=False)[0]
+            started = time.monotonic()
+            result = model.predict(frame, classes=[0], conf=args.confidence,
+                                   imgsz=args.imgsz, verbose=False)[0]
+            inference_ms = (time.monotonic() - started) * 1000
             zones = set()
             if result.boxes is not None:
                 for x1, y1, x2, y2 in result.boxes.xyxy.cpu().tolist():
                     zone = person_zone(x1, x2, width)
                     zones.add(zone)
                     color = (0, 0, 255) if zone == "CENTER" else (0, 200, 255)
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                    cv2.putText(frame, zone, (int(x1), max(20, int(y1) - 8)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    if not args.no_display:
+                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                        cv2.putText(frame, zone, (int(x1), max(20, int(y1) - 8)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             action = choose_action(zones)
-            robot.update(action)
+            robot.update(action, captured_at)
+            age_ms = (time.monotonic() - captured_at) * 1000
+            timing = f"infer={inference_ms:.0f}ms frame-age={age_ms:.0f}ms"
+            if time.monotonic() - last_log >= 2:
+                print(f"[PERF] {timing} stop={robot.stopped}", flush=True)
+                last_log = time.monotonic()
             if action == "STOP":
                 voice.close()
             elif action.startswith("WARN"):
                 voice.warn(action)
+
+            if args.no_display:
+                continue
 
             for boundary in (width // 3, width * 2 // 3):
                 cv2.line(frame, (boundary, 0), (boundary, height), (180, 180, 180), 1)
             state = "STOP LATCHED" if robot.stopped else action
             cv2.putText(frame, f"WS SERVER | {state} | Q: quit", (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
+            cv2.putText(frame, timing, (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, (0, 255, 255), 1)
             cv2.imshow("Robot person detection", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break

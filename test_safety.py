@@ -1,6 +1,7 @@
 """카메라와 모터 없이 판단 로직 및 실제 로컬 WebSocket 통신을 검증한다."""
 import importlib.util
 import json
+import threading
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -11,6 +12,44 @@ spec.loader.exec_module(detector)
 
 
 class SafetyTests(unittest.TestCase):
+    def test_latest_camera_discards_intermediate_frames(self):
+        ready = threading.Event()
+        finish = threading.Event()
+
+        class Capture:
+            count = 0
+
+            def read(self):
+                self.count += 1
+                if self.count <= 3:
+                    return True, self.count
+                ready.set()
+                finish.wait(2)
+                return False, None
+
+            def release(self):
+                pass
+
+        camera = detector.LatestCamera(Capture())
+        try:
+            self.assertTrue(ready.wait(1))
+            frame, timestamp = camera.read()
+            self.assertEqual(frame, 3)
+            self.assertGreater(timestamp, 0)
+            finish.set()
+            camera.thread.join(1)
+            with self.assertRaises(RuntimeError):
+                camera.read()
+        finally:
+            finish.set()
+            camera.release()
+
+    def test_old_result_cannot_enable_driving(self):
+        server = detector.SafetyServer("127.0.0.1", 0)
+        with patch.object(detector.time, "monotonic", return_value=12):
+            server.update("CLEAR", captured_at=10)
+            self.assertTrue(server.snapshot()["stop"])
+
     def test_regions_and_priority(self):
         self.assertEqual(detector.person_zone(0, 100, 900), "LEFT")
         self.assertEqual(detector.person_zone(700, 890, 900), "RIGHT")
