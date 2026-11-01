@@ -1,16 +1,3 @@
-"""웹캠 + YOLOv8 감지로 FTC 로봇에 저속 전진/회피 명령을 전송한다.
-
-설치: pip install -r requirements.txt
-실행: python 001.py
-FTC Java 클라이언트: ws://이_PC의_IP:5000
-
-Java 클라이언트가 상태를 요청하면 최신 감지 결과를 JSON으로 응답한다.
-감지 전에는 주행 불가, 감지 갱신이 1초 이상 멈추면 정지를 유지한다.
-정면 감지 → 정지 → 짧은 좌우 회전 → 재확인 후 전진한다.
-통신/감지 오류는 정지를 유지한다. 화면 방향은 반전하지 않은 웹캠 기준이다.
-macOS는 say, Linux는 espeak-ng 또는 espeak가 있어야 TTS가 동작한다.
-"""
-
 import argparse
 import json
 import shutil
@@ -20,14 +7,12 @@ import time
 
 
 def person_zone(x1, x2, width):
-    """사람 상자가 중앙 구역에 조금이라도 걸치면 중앙으로 처리한다."""
     if x2 >= width / 3 and x1 <= width * 2 / 3:
         return "CENTER"
     return "LEFT" if x2 < width / 3 else "RIGHT"
 
 
 def choose_action(zones):
-    """여러 사람이 있을 때 중앙 정지를 우선한다."""
     if "CENTER" in zones:
         return "STOP"
     if "LEFT" in zones and "RIGHT" in zones:
@@ -40,7 +25,6 @@ def choose_action(zones):
 
 
 class AvoidancePlanner:
-    """바운딩 박스 기반 휴리스틱. 빈 구역이 실제 통행 가능함을 보장하지 않는다."""
     PAUSE_SECONDS = 0.3
     TURN_SECONDS = 0.5
     MAX_TURNS = 4
@@ -55,7 +39,6 @@ class AvoidancePlanner:
         self.attempts = 0
 
     def advance(self, now):
-        # 추론이 끝나지 않아도 서버 요청 시 회전 시간을 제한한다.
         if self.phase == "TURN" and now >= self.deadline:
             self.phase = "CHECK"
             self.command = "STOP"
@@ -80,7 +63,7 @@ class AvoidancePlanner:
             return
 
         if self.phase in {"PAUSE", "CHECK"} and captured_at < self.deadline:
-            return  # 정지/회전 전에 촬영된 프레임으로 재출발하지 않는다.
+            return
 
         if not front:
             if self.phase == "FORWARD":
@@ -113,7 +96,6 @@ class AvoidancePlanner:
         elif right_blocked:
             direction = "LEFT"
         else:
-            # 양옆에 감지된 대상이 없으면 정면 대상의 중심에서 먼 방향으로 회전.
             center = sum((b[0] + b[2]) / 2 for b in front) / len(front)
             direction = "RIGHT" if center <= width / 2 else "LEFT"
         self.phase = "TURN"
@@ -165,7 +147,6 @@ class SafetyServer:
                 self.fault_reason = "STALE_DETECTION"
             self.planner.advance(now)
             command = "STOP" if self.stopped else self.planner.command
-            # Java가 네트워크 왕복 시간까지 빼서 명령 유효 시간을 계산한다.
             ttl = 0.5
             if self.updated_at is not None:
                 ttl = min(ttl, max(0, self.updated_at + 1.0 - now))
@@ -238,7 +219,6 @@ class SafetyServer:
 
 
 class LatestCamera:
-    """캡처를 계속 수행하고 아직 처리하지 않은 최신 한 장만 유지한다."""
     def __init__(self, capture):
         self.capture = capture
         self.condition = threading.Condition()
@@ -302,7 +282,6 @@ class VoiceWarning:
             raise RuntimeError("TTS 실행기가 없습니다. macOS say 또는 Linux espeak-ng가 필요합니다.")
 
     def warn(self, action):
-        # 음성 재생을 기다리지 않아 영상 감지를 계속할 수 있다.
         if self.process is not None:
             status = self.process.poll()
             if status is None:
@@ -326,7 +305,7 @@ class VoiceWarning:
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser()
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--imgsz", type=int, default=320, help="YOLO 입력 크기")
     parser.add_argument("--no-display", action="store_true", help="영상 창 없이 실행")
@@ -355,10 +334,8 @@ def main():
 
         voice = VoiceWarning(args.warning_interval)
         model = YOLO(args.model)
-        # COCO 사전학습 YOLOv8 모델의 person 클래스만 사용한다.
         if model.names.get(0) != "person":
             raise ValueError("0번 클래스가 person인 COCO YOLOv8 모델을 사용하세요.")
-        # 최초 모델 초기화 시간을 이동 중 감지 지연에 포함하지 않도록 사전 실행한다.
         model.predict(np.zeros((args.imgsz, args.imgsz, 3), dtype=np.uint8),
                       classes=[0], imgsz=args.imgsz, verbose=False)
         camera = cv2.VideoCapture(args.camera)
@@ -366,7 +343,7 @@ def main():
             raise RuntimeError("웹캠을 열 수 없습니다. 연결과 --camera 번호를 확인하세요.")
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 백엔드에 따라 지원하지 않을 수 있다.
+        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         camera = LatestCamera(camera)
         last_log = 0.0
 
@@ -416,7 +393,6 @@ def main():
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:
-        # 영상/추론 오류와 프로그램 종료 시에도 정지를 요청한다.
         try:
             robot.stop("프로그램 종료 또는 감지 오류")
         finally:

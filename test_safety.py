@@ -1,4 +1,3 @@
-"""카메라와 모터 없이 판단 로직 및 실제 로컬 WebSocket 통신을 검증한다."""
 import importlib.util
 import json
 import threading
@@ -120,10 +119,8 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(message["command"], expected)
             self.assertEqual(message["power"], 0.2)
             self.assertLessEqual(message["valid_for_ms"], 500)
-            # 추론 호출이 없어도 회전 기한이 지나면 STOP을 반환한다.
             with patch.object(detector.time, "monotonic", return_value=11.21):
                 self.assertEqual(server.snapshot()["command"], "STOP")
-            # 회전 중 찍은 프레임은 재출발 판단에 사용하지 않는다.
             self.assertEqual(self.observe(server, [], 11.3, 11.15)["command"], "STOP")
             for t in (11.51, 11.61):
                 self.assertEqual(self.observe(server, [], t)["command"], "STOP")
@@ -187,7 +184,6 @@ class SafetyTests(unittest.TestCase):
                 client.send("STATUS")
                 self.assertEqual(json.loads(client.recv(timeout=2))["command"], "STOP")
                 server.stop("test fault")
-            # 정지 후 접속하는 클라이언트도 STOP을 받는다.
             with connect(url) as client:
                 client.send("STATUS")
                 self.assertTrue(json.loads(client.recv(timeout=2))["fault"])

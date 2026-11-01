@@ -12,7 +12,6 @@ import java.net.URI;
 
 @TeleOp(name = "roboticsDog (YOLO Auto Avoid)")
 public class roboticsDog extends LinearOpMode {
-    // Python을 실행하는 PC의 실제 Wi-Fi IP로 변경하세요. 로봇 자신의 IP가 아닙니다.
     private static final String SERVER_URL = "ws://192.168.0.10:5000";
     private DcMotor LeftFrontWheel, LeftBackWheel, RightFrontWheel, RightBackWheel;
     private Servo LeftFrontServo, LeftBackServo, RightFrontServo, RightBackServo;
@@ -50,13 +49,12 @@ public class roboticsDog extends LinearOpMode {
 
         SafetyClient client = new SafetyClient(URI.create(SERVER_URL));
         try {
-            client.connect(); // 비동기 연결: OpMode 스레드를 막지 않는다.
+            client.connect();
             telemetry.addData("Server", SERVER_URL);
             telemetry.addLine("AUTO: START enables motion at power 0.2. B = emergency stop.");
             telemetry.update();
             waitForStart();
             while (opModeIsActive()) {
-                // 콜백은 상태만 변경하고, 모터는 이 OpMode 루프에서만 제어한다.
                 synchronized (client) {
                     client.pollStatus();
                     if (gamepad1.b) {
@@ -88,7 +86,6 @@ public class roboticsDog extends LinearOpMode {
 
     private void applyCommand(String command, double power) {
         long now = System.nanoTime();
-        // 진행 방향을 바꾸기 전 실제 모터 출력 0을 최소 300ms 유지한다.
         if (!command.equals(appliedCommand) && !"STOP".equals(appliedCommand)) {
             stopWheels();
             appliedCommand = "STOP";
@@ -109,7 +106,6 @@ public class roboticsDog extends LinearOpMode {
         appliedCommand = command;
     }
 
-    // 원래 Go/Left/Right의 모터 부호를 유지한다. sleep 없이 매 루프 재평가한다.
     private void Go(double power) {
         LeftFrontWheel.setPower(power);
         LeftBackWheel.setPower(power);
@@ -132,8 +128,8 @@ public class roboticsDog extends LinearOpMode {
     }
 
     static class SafetyClient extends WebSocketClient {
-        private static final long POLL_NS = 100_000_000L; // 100ms
-        private static final long TIMEOUT_NS = 750_000_000L; // 750ms
+        private static final long POLL_NS = 100_000_000L;
+        private static final long TIMEOUT_NS = 750_000_000L;
         private boolean connected = false;
         private boolean pending = false;
         private boolean received = false;
@@ -152,7 +148,6 @@ public class roboticsDog extends LinearOpMode {
         }
 
         private void block(String reason) {
-            // 뒤따르는 타임아웃/연결 종료로 최초 오류 원인이 가려지지 않게 한다.
             if (!stopLatched) {
                 status = reason;
                 errorResponse = lastResponse;
@@ -169,7 +164,6 @@ public class roboticsDog extends LinearOpMode {
                 block("TIMEOUT - restart OpMode");
             }
             if (connected && !pending && now - sentAt >= POLL_NS) {
-                // 한 번에 한 요청만 전송해 오래된 이동 응답이 쌓이지 않게 한다.
                 pending = true;
                 sentAt = now;
                 try {
@@ -215,8 +209,6 @@ public class roboticsDog extends LinearOpMode {
                     return;
                 }
                 JSONObject data = new JSONObject(message);
-                // 필드를 읽기 전에 프로토콜을 확인한다. 구버전 safety JSON도
-                // 올바른 JSON이므로 문법 오류와 별도로 안내해야 한다.
                 if (!"drive".equals(data.optString("type")) || data.optInt("version", -1) != 2) {
                     block("PROTOCOL MISMATCH: need Python drive v2; update BOTH sides");
                     return;
@@ -257,7 +249,6 @@ public class roboticsDog extends LinearOpMode {
                 }
                 receivedAt = now;
                 received = true;
-                // 요청 송신 시점부터 TTL을 계산해 네트워크 왕복 시간을 보수적으로 뺀다.
                 expiresAt = sentAt + (long) ttl * 1_000_000L;
                 if (fault) {
                     block("DETECTOR FAULT - restart server and OpMode");
