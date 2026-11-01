@@ -13,6 +13,10 @@ import java.net.URI;
 @TeleOp(name = "roboticsDog (YOLO Auto Avoid)")
 public class roboticsDog extends LinearOpMode {
     private static final String SERVER_URL = "ws://192.168.0.10:5000";
+    private static final double LEFT_FRONT_TRIM = 1.0;
+    private static final double LEFT_BACK_TRIM = 1.0;
+    private static final double RIGHT_FRONT_TRIM = 1.0;
+    private static final double RIGHT_BACK_TRIM = 1.0;
     private DcMotor LeftFrontWheel, LeftBackWheel, RightFrontWheel, RightBackWheel;
     private Servo LeftFrontServo, LeftBackServo, RightFrontServo, RightBackServo;
     private String appliedCommand = "STOP";
@@ -64,6 +68,9 @@ public class roboticsDog extends LinearOpMode {
                     telemetry.addData("Vision", client.status);
                     telemetry.addData("Stop latched", client.stopLatched);
                     telemetry.addData("Motors", appliedCommand);
+                    telemetry.addData("Power LF/LB/RF/RB", "%.2f / %.2f / %.2f / %.2f",
+                            LeftFrontWheel.getPower(), LeftBackWheel.getPower(),
+                            RightFrontWheel.getPower(), RightBackWheel.getPower());
                     if (!client.errorResponse.isEmpty()) {
                         telemetry.addData("Failed response", client.errorResponse);
                     }
@@ -107,24 +114,26 @@ public class roboticsDog extends LinearOpMode {
     }
 
     private void Go(double power) {
-        LeftFrontWheel.setPower(power);
-        LeftBackWheel.setPower(power);
-        RightFrontWheel.setPower(power);
-        RightBackWheel.setPower(power);
+        setWheelPowers(-power, -power, -power, -power);
     }
 
     private void Left(double power) {
-        LeftFrontWheel.setPower(-power);
-        LeftBackWheel.setPower(-power);
-        RightFrontWheel.setPower(power);
-        RightBackWheel.setPower(power);
+        setWheelPowers(power, -power, -power, power);
     }
 
     private void Right(double power) {
-        LeftFrontWheel.setPower(power);
-        LeftBackWheel.setPower(power);
-        RightFrontWheel.setPower(-power);
-        RightBackWheel.setPower(-power);
+        setWheelPowers(-power, power, power, -power);
+    }
+
+    private void setWheelPowers(double leftFront, double leftBack, double rightFront, double rightBack) {
+        LeftFrontWheel.setPower(trimmedPower(leftFront, LEFT_FRONT_TRIM));
+        LeftBackWheel.setPower(trimmedPower(leftBack, LEFT_BACK_TRIM));
+        RightFrontWheel.setPower(trimmedPower(rightFront, RIGHT_FRONT_TRIM));
+        RightBackWheel.setPower(trimmedPower(rightBack, RIGHT_BACK_TRIM));
+    }
+
+    private static double trimmedPower(double power, double trim) {
+        return Math.max(-0.2, Math.min(0.2, power)) * Math.max(0.0, Math.min(1.0, trim));
     }
 
     static class SafetyClient extends WebSocketClient {
